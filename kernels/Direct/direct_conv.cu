@@ -196,7 +196,7 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
   }
 
   /* make sure that 1024 threads isn't crossed*/
-  int tile_width = 2 , tile_height = 2;   
+  int tile_width = 16 , tile_height = 16;   
   int w_grid = ceil((W_out*1.0) / tile_width);
   int h_grid = ceil((H_out*1.0) / tile_height);
  
