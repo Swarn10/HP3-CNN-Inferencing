@@ -56,7 +56,7 @@ typedef enum{
   t_CUSTOM_DIRECT,
   t_CUSTOM_FFT,
   t_CUSTOM_IM2COL,
-  t_CUSTOM_IM2COL_CUBLAS
+  t_CUSTOM_WINOGRAD
 } customAlgorithmType; 
 
 /* Class for Convolution Operation :
@@ -149,7 +149,7 @@ class Conv2D {
   float* Conv_FFT(float* input, profilingElapsedTime &time_elapsed);
 
   /* Forward Pass Operation using WInograd Kernel */
-  float* Conv_Im2Col_Cublas(float* input, profilingElapsedTime &time_elapsed);
+  float* Conv_Winograd(float* input, profilingElapsedTime &time_elapsed);
 
   /* Forward Pass Operation using Im2Col Kernel */
   float* Conv_Im2Col(float* input, profilingElapsedTime &time_elapsed);
