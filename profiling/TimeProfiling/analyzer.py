@@ -139,7 +139,7 @@ def plotLayerWiseDataForTimeType(data, layer_cols, layer_specification_dict, bat
     ax.set_position([box.x0, box.y0, box.width , box.height * 0.95]) # resize position
     
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles=handles[1:], labels=labels[1:],bbox_to_anchor=(0.5, 1.1), loc='upper center' , borderaxespad=0., ncol = len(layer_cols)-1)
+    #ax.legend(handles=handles[1:], labels=labels[1:],bbox_to_anchor=(0.5, 1.1), loc='upper center' , borderaxespad=0., ncol = len(layer_cols)-1)
     
     mean_d = df_to_plot.groupby(['X_LABELS','ALGO']).mean().reset_index()
     for i,row in mean_d.iterrows():
@@ -193,7 +193,7 @@ def batchWisePlot(data, layer_cols, layer_specification_dict, architecture, plot
     ax.set_position([box.x0, box.y0, box.width , box.height * 0.95]) # resize position
 
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles=handles[1:], labels=labels[1:],bbox_to_anchor=(0.5, 1.1), loc='upper center' , borderaxespad=0., ncol = len(layer_cols)-1)
+    #ax.legend(handles=handles[1:], labels=labels[1:],bbox_to_anchor=(0.5, 1.1), loc='upper center' , borderaxespad=0., ncol = len(layer_cols)-1)
 
     mean_d = data_batchwise.groupby(['BATCHSIZE','ALGO']).mean()['SUM'].reset_index()
     for i,row in mean_d.iterrows():
