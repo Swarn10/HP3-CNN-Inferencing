@@ -49,9 +49,9 @@ void direct_convolution(int input_channels, int input_height, int input_width, i
     int c, i , j , p , q;
     for(c = 0; c < input_channels; c++) {
         
-      for(i = 0; i + h0 < kernal_height; i += tile_w) {
-          for(j = 0; j + w0 < kernal_width; j += tile_w) {
-              W_shared[(i+h0)*kernal_width + (j+w0)] = W_filter[m*(input_channels*kernel_height*kernel_width) + c*(kernel_height*kernel_width) + (i+h0)*(kernel_height) + (j+w0)];
+      for(i = 0; i + h0 < kernel_height; i += tile_w) {
+          for(j = 0; j + w0 < kernel_width; j += tile_w) {
+              W_shared[(i+h0)*kernel_width + (j+w0)] = W_filter[m*(input_channels*kernel_height*kernel_width) + c*(kernel_height*kernel_width) + (i+h0)*(kernel_height) + (j+w0)];
           }
       }
       __syncthreads();
