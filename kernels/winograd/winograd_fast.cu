@@ -1,210 +1,524 @@
-#include "im2col.hpp"
+#include "wingheader.h"
 
-// converts a batch of images of shape: data_im: batch x ic x ih x iw (ic: input_channels in image)
-// to 2D col of shape: data_col: batch x (ic * kh * kw) x (hcol * wcol)
-// filter size: kh x kw
-// kernel multiplication patches: hcol x wcol (Based on input size, kernel size, padding, stride)
-// Each thread writes one kernel multiplication patch (kh x kw) in data_col
-// n is the number of tasks (here: ic * hcol * wcol, ie number of kernel patches per image)
-__global__ void im2col_kernel(const float * data_im, float * data_col, const int n,
-							  const int kh, const int kw, const int pad, const int stride,
-							  const int ih, const int iw, const int ic,
-							  const int hcol, const int wcol) 
-{
-	// esentially this loop could have run batch size number of times
-	// but since we are launching enough threads to handle each image separately, it executes just once
-	// here it is majorly prevents any extra threads we launch from accessing memory
-	CUDA_KERNEL_LOOP(index, n)
-	{
-		// figure out which part of which image you will work on
-		int imidx = blockIdx.y;
-		int w_out = index % wcol;
-		index /= wcol;
-		int h_out = index % hcol;
-		int channel_in = index / hcol;
-		int h_in = h_out * stride - pad;
-		int w_in = w_out * stride - pad;
-		// this thread will write the output patch (kh x kw) at location (imidx, channel_out, h_out, w_out)
-		// that patch is based on the image patch at (imidx, channel_in, h_in, w_in)
-		// i.e. will do the work for patch centred at (channel_in, h_in, w_in) in image imidx
-		data_im += ((imidx * ic + channel_in) * ih + h_in) * iw + w_in;
-		data_col += ((imidx * ic + channel_in) * kh * kw * hcol + h_out) * wcol + w_out;
-		#pragma unroll
-		for (int i = 0; i < kh; ++i) {
-			for (int j = 0; j < kw; ++j) {
-				int h = h_in + i;
-				int w = w_in + j;
-				*data_col = (h >= 0 && w >= 0 && h < ih && w < iw) ?
-				  data_im[i * iw + j]: 0;
-				data_col += hcol * wcol;
-			}
-		}
-	}
+#define MAX_B 1
+#define MAX_THREAD 1024
+#define LOOP(x) for(int t##x = 0; t##x < x; t##x++)
+#define cudaSafeCall(call)  \
+        do {\
+            cudaError_t err = call;\
+            if (cudaSuccess != err) \
+            {\
+                std::cerr << "CUDA error in " << __FILE__ << "(" << __LINE__ << "): " \
+                    << cudaGetErrorString(err);\
+                exit(EXIT_FAILURE);\
+            }\
+        } while(0)
+#define ACCESS(arr, off, ind) ((arr)[(off) + (ind)])
+#define ACCESS2D(arr, indx, indy) ((arr)[(indx)][(indy)])
+
+
+void gpu_error(cudaError_t const &code) {
+    if(code != cudaSuccess)
+    {
+        std::cerr << "GPUError: Code " << code << " : " << cudaGetErrorString(code) << std::endl;
+        exit( EXIT_FAILURE );
+    }
 }
 
-// takes a batch of images on GPU: bs x ic x ih x iw (ic: input channels, bs: batch size)
-// and the kernels on GPU: oc x ic x kh x kw (oc: output channels)
-// does the convolution based on padding (pad) and stride
-// data_col is used for intermediate col form storage
-// output is returned in data_out
-void im2col_gemm_gpu(const float * data_im, const float * data_ker, cublasHandle_t handle,
-					 const int kh, const int kw, const int pad, const int stride,
-					 const int ih, const int iw, const int ic, const int oc,
-					 float * data_col, float * data_out, int bs)
+__global__ void precompute(int och, int ch, float* kernel_weights, float *U)
 {
-	// Step 1: convert the image to col form
-	
-	// dimensions of the col corr to this image
-	int hcol = (ih + 2 * pad - kh) / stride + 1;
-	int wcol = (iw + 2 * pad - kw) / stride + 1;
+    int tch = blockIdx.x;
+    int toch = threadIdx.x;
+   
+    float au, bu, cu, du, eu, fu, gu, hu, iu;
+    int ind = 0;
+    int offset = (toch*ch + tch)*9;
 
-	// We are going to launch bs groups of ic * hcol * wcol kernels threads for im2col,
-	// each thread is responsible for copying a single-channel kernel multiplication patch
-	// i.e. one thread per output pixel in the output of conv
-	// So, all images in batch are converted to col form parallely
-	int op_size = ic * hcol * wcol;
-	dim3 blocks(GET_BLOCKS(op_size), bs, 1);
-	dim3 threads(CUDA_NUM_THREADS, 1, 1);
-	im2col_kernel<<<blocks, threads>>>(data_im, data_col, op_size, kh, kw, pad, stride, ih, iw, ic, hcol, wcol);
-	CUDA_POST_KERNEL_CHECK; // check if there was any error
-
-	// now, the col form shall be multiplied with the kernels laid out straight i.e. (ic * kh * kw)
-	// so, since, oc is the number of kernels, we get:
-	// "2D kernel matrix" oc x (ic * kh * kw)
-	// and the "2D col matrix" for one image is: (ic * kh * kw) x (hcol * wcol)
-	// and you see that magically, their multiplication output is:
-	// output: oc x (hcol * wcol)... ie oc x hcol x wcol, the exact shape needed by next convolution
-	// output: oc x (hcol * wcol)... ie oc x hcol x wcol, the exact shape needed by next im2col
-	// so, there is no need to ever work things back (col2im) or reshape either
-	// in sumamary, we do matmul(kernel, im2col(im_input)) -> conv_output (in "correct" form)
-
-	// Step 2: GEMM using libcublas
-
-	// get params ready for GEMM call
-	// Performs C + i*strideC = α op(A + i*strideA) op(B + i*strideB) + β(C + i* strideC) 
-	// for i ∈ [0, batchSize − 1]
-	// Thus, this one call will parallely do the matrix multiplication for all images in the batch
-	// Since we are doing A * B, we need α = 1, β = 0
-	// Since we don't need any transpose, op = CUBLAS_OP_N
-	const float alpha = 1.0f;
-	const float beta  = 0.0f;
-	int ldA, ldB, ldC;
-	int m = ldA = ldC = hcol * wcol;
-	int n = oc;
-	int k = ldB = ic * kh * kw;
-	long long int strideA = m * k;	// size of each col form
-	long long int strideB = 0;		// reusing the same kernel matrix for each image
-	long long int strideC = m * n;	// size of output feature map
-	
-	// CUDA sees matrices as column major
-	// So, a matrix we see as HxW, it would see as WxH in the same memory layout
-	// So, matA (our view) -> matA' (CUDA view)
-	// Thus, to do matA * matB in our view, we shall run CUDA for matB * matA.
-	// Output would be matB' * matA' (CUDA view) = (matA * matB)' (CUDA view) = matA * matB (our view)
-	// In essence, trust me when I do col * kernel to achieve kernel * col
-
+    au = ACCESS(kernel_weights, offset, ind++);
+    bu = ACCESS(kernel_weights, offset, ind++);
+    cu = ACCESS(kernel_weights, offset, ind++);
+    du = ACCESS(kernel_weights, offset, ind++);
+    eu = ACCESS(kernel_weights, offset, ind++);
+    fu = ACCESS(kernel_weights, offset, ind++);
+    gu = ACCESS(kernel_weights, offset, ind++);
+    hu = ACCESS(kernel_weights, offset, ind++);
+    iu = ACCESS(kernel_weights, offset, ind++);
     
-	cublasStatus_t ret =
-		cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, data_col, 
-						ldA, strideA, data_ker, ldB, strideB, &beta, data_out, ldC, strideC, bs);
-	CUBLAS_CHECK(ret, "cublas Sgemm returned an error!");
+    ind = 0;
+    offset = (toch*ch + tch)*16;
+
+    float adg, beh, cfi, a_dg, b_eh, c_fi;
+    adg = au+du+gu;
+    beh = bu+eu+hu;
+    cfi = cu+fu+iu;
+    a_dg = au-du+gu;
+    b_eh = bu-eu+hu;
+    c_fi = cu-fu+iu;
+    
+    ACCESS(U, offset, ind++) = au;
+    ACCESS(U, offset, ind++) = 0.5*(au+bu+cu);
+    ACCESS(U, offset, ind++) = 0.5*(au-bu+cu);
+    ACCESS(U, offset, ind++) = cu;
+    ACCESS(U, offset, ind++) = 0.5*(adg);
+    ACCESS(U, offset, ind++) = 0.25*(adg+beh+cfi);
+    ACCESS(U, offset, ind++) = 0.25*(adg-beh+cfi);
+    ACCESS(U, offset, ind++) = 0.5*(cfi);
+    ACCESS(U, offset, ind++) = 0.5*(a_dg);
+    ACCESS(U, offset, ind++) = 0.25*(a_dg+b_eh+c_fi);
+    ACCESS(U, offset, ind++) = 0.25*(a_dg-b_eh+c_fi);
+    ACCESS(U, offset, ind++) = 0.5*(c_fi);
+    ACCESS(U, offset, ind++) = gu;
+    ACCESS(U, offset, ind++) = 0.5*(gu+hu+iu);
+    ACCESS(U, offset, ind++) = 0.5*(gu-hu+iu);
+    ACCESS(U, offset, ind++) = iu;
+    
 }
 
-// takes a batch of images on CPU: data_im:  batch x ic x ih x iw (ic: input channels)
-// and the kernels on CPU: data_ker: oc x ic x kh x kw (oc: output channels)
-// does the convolution based on padding (pad) and stride
-// returns the convolution output on CPU
-// conv_time & overhead_time are used for kernel timing
-float * im2colWithCuda(const float * data_im, const float * data_ker, const int batch,
-					   const int kh, const int kw, const int pad, const int stride,
-					   const int ih, const int iw, const int ic, const int oc, 
-					   float& conv_time, float& overhead_time)
+
+__global__ void paddev(float *devin, float *devinnopad, int h, int w, int pad)
 {
-
-	// Timing variables - CUDA Event API
-	overhead_time = 0;
-	conv_time = 0;
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);  
-
-	// image dim
-	ssize_t image_size = ic * ih * iw;
-	ssize_t images_size = batch * image_size;
-
-	// kernel dim
-	ssize_t K = ic * kh * kw;
-	ssize_t kernels_size = oc * K;
-
-	// col dim
-	ssize_t hcol = (ih + 2 * pad - kh) / stride + 1;
-	ssize_t wcol = (iw + 2 * pad - kw) / stride + 1;
-	ssize_t one_col = ic * kh * kw * hcol * wcol;
-	ssize_t col_batch = batch * one_col;
-
-	// output dim
-	ssize_t output_feature = oc * hcol * wcol;	
-	ssize_t result_size = batch * output_feature;
-	
-	// move images to GPU
-	float * dev_image = nullptr;
-	CUDA_CHECK(cudaMalloc((void**)&dev_image, images_size * sizeof(float)));
-	CUDA_CHECK(cudaMemcpy(dev_image, data_im, images_size * sizeof(float), cudaMemcpyHostToDevice));
-	
-	// move kernels to GPU
-	float * dev_kernel = nullptr;
-	CUDA_CHECK(cudaMalloc((void**)&dev_kernel, kernels_size * sizeof(float)));
-	CUDA_CHECK(cudaMemcpy(dev_kernel, data_ker, kernels_size * sizeof(float), cudaMemcpyHostToDevice));
-
-	// allocate GPU memory for intermediate col form
-	float * dev_col = nullptr;
-	CUDA_CHECK(cudaMalloc((void**)&dev_col, col_batch * sizeof(float)));
-
-	// allocate GPU memory for convlution result
-	float * dev_ret = nullptr;
-	CUDA_CHECK(cudaMalloc((void**)&dev_ret, result_size * sizeof(float)));
-
-	// cuBLAS initialize
-	cublasHandle_t handle;
-	CUBLAS_CHECK(cublasCreate(&handle), "cublasCreate() error!");
-	
-	// Record the kernel run time
-	cudaEventRecord(start);
-	// Kernel launch - this single call will handle all the images in the batch parallely
-	im2col_gemm_gpu(dev_image, dev_kernel, handle, kh, kw, pad, stride, ih, iw, ic, oc, dev_col, dev_ret, batch);
-	cudaEventRecord(stop);
-	
-	cudaEventSynchronize(stop);
-	cudaEventElapsedTime(&conv_time, start, stop);
-
-	// cuBLAS finalize
-	CUBLAS_CHECK(cublasDestroy(handle), "cublasDestroy() error!");
-	
-	// Check for any errors launching the kernel
-	CUDA_POST_KERNEL_CHECK;
-
-	// Copy output vector from GPU to host memory.
-	float * data_ret = (float *)malloc(result_size * sizeof(float));
-	CUDA_CHECK(cudaMemcpy(data_ret, dev_ret, result_size * sizeof(float), cudaMemcpyDeviceToHost));
-
-	// Free CUDA memory
-	cudaFree(dev_image);
-	cudaFree(dev_col);
-	cudaFree(dev_kernel);
-	cudaFree(dev_ret);
-	
-	// Free timing resources
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-
-	return data_ret;
+    int newh = gridDim.y;
+    int neww = gridDim.z;
+    int tbs = blockIdx.x;
+    int tch = threadIdx.x;
+    int ch = blockDim.x;
+    int tnewh = blockIdx.y;
+    int tneww = blockIdx.z;
+    int newhw = newh*neww;
+    int hw = h*w;
+    int th = tnewh-pad;
+    int tw = tneww-pad;
+    int tbsch = tbs*ch + tch;
+    
+    if(th >= 0 && th < h && tw >= 0 && tw < w)
+        devin[tbsch*newhw + tnewh*neww + tneww] = devinnopad[tbsch*hw + th*w + tw];
+    else
+        devin[tbsch*newhw + tnewh*neww + tneww] = 0;
+    
 }
 
-// The exposed library function which just calls im2colWithCuda the right way
-float* IM2COL::forward(int out_size, int channel, int kernel_height, int kernel_width, int pad, 
-		int stride, float* kernel, int batch_size, int input_height, int input_width, float* input, 
-		float& conv_time, float& overhead_time)
+__global__ void cutpad(float  *devY, float *devcutY, int oph,int opw)
 {
-	return im2colWithCuda(input, kernel, batch_size, kernel_height, kernel_width, 
-					pad, stride, input_height, input_width, channel, out_size, conv_time, overhead_time);
+    int p = gridDim.y;
+    int q = gridDim.z;
+    int tbs = blockIdx.x;
+    int tp = blockIdx.y;
+    int tq = blockIdx.z;
+    int toch = threadIdx.x;
+    int och = blockDim.x;
+    int offset = tbs*och+toch;
+    int ophopw = oph*opw;
+    for(int i = 0; i < 2; i++)
+    {
+        for(int j = 0; j < 2; j++)
+        {
+            if(tp*2 + i < oph && tq*2 + j < opw)
+                devcutY[offset*ophopw + (tp*2+i)*opw + (tq*2+j)] = devY[(((offset*p + tp)*q +tq)*2 + i)*2  + j];
+        }
+    }
+}
+
+__global__ void tile(int bs, int p, int q, int ch, float *devin, float *devsum, float *devU, int h, int w, int och, float *devfin)
+{
+    int tbs, tp, tq, tch, Tch;
+    tbs = blockIdx.x;
+    tp = blockIdx.y;
+    tq = blockIdx.z;
+    Tch = threadIdx.x;
+    tch = Tch / och;
+
+    float V[4][4];
+    
+    // copy the tiles to thrtile
+    // int offset1 = (tbs*ch + tch)*h*w;
+    // for(int th = 2*tp, i = 0; i < 4; th++, i++)
+    //     for(int tw = 2*tq, j = 0; j < 4; tw++, j++)
+    //         thrtile[i][j] = devin[offset1 + th*w + tw];
+
+    int offset1 = (tbs*ch + tch)*h*w;
+    
+    float av, bv, cv, dv, ev, fv, gv, hv, iv, jv, kv, lv, mv, nv, ov, pv;
+    int th = 2*tp, tw = 2*tq;
+    av = ACCESS(devin, offset1, th*w + tw++);
+    bv = ACCESS(devin, offset1, th*w + tw++);
+    cv = ACCESS(devin, offset1, th*w + tw++);
+    dv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    ev = ACCESS(devin, offset1, th*w + tw++);
+    fv = ACCESS(devin, offset1, th*w + tw++);
+    gv = ACCESS(devin, offset1, th*w + tw++);
+    hv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    iv = ACCESS(devin, offset1, th*w + tw++);
+    jv = ACCESS(devin, offset1, th*w + tw++);
+    kv = ACCESS(devin, offset1, th*w + tw++);
+    lv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    mv = ACCESS(devin, offset1, th*w + tw++);
+    nv = ACCESS(devin, offset1, th*w + tw++);
+    ov = ACCESS(devin, offset1, th*w + tw++);
+    pv = ACCESS(devin, offset1, th*w + tw++);
+    
+    //Calculation of V
+    int vx = 0, vy = 0;
+    ACCESS2D(V, vx, vy++) = +av-iv-cv+kv;
+    ACCESS2D(V, vx, vy++) = +bv-jv+cv-kv;
+    ACCESS2D(V, vx, vy++) = -bv+jv+cv-kv;
+    ACCESS2D(V, vx, vy++) = +bv-jv-dv+lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = +ev+iv-gv-kv;
+    ACCESS2D(V, vx, vy++) = +fv+jv+gv+kv;
+    ACCESS2D(V, vx, vy++) = -fv-jv+gv+kv;
+    ACCESS2D(V, vx, vy++) = +fv+jv-hv-lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = -ev+iv+gv-kv;
+    ACCESS2D(V, vx, vy++) = -fv+jv-gv+kv;
+    ACCESS2D(V, vx, vy++) = +fv-jv-gv+kv;
+    ACCESS2D(V, vx, vy++) = -fv+jv+hv-lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = +ev-mv-gv+ov;
+    ACCESS2D(V, vx, vy++) = +fv-nv+gv-ov;
+    ACCESS2D(V, vx, vy++) = -fv+nv+gv-ov;
+    ACCESS2D(V, vx, vy++) = +fv-nv-hv+pv;
+
+    __syncthreads();
+
+    int toch = Tch % och;
+    tch = Tch / och;
+
+    for(int i = 0; i <4; ++i)
+        for(int j = 0; j <4; ++j)
+            devfin[(((((tbs*p+tp)*q+tq)*ch+tch)*och+toch)*4+i)*4+j] = devU[((toch*ch+tch)*4+i)*4+j]*V[i][j]; 
+    
+    __syncthreads();
+
+    for(int s = 1; s < ch; s *= 2)
+    {
+        if(tch % (2*s) == 0 && tch+s < ch)
+        {
+            toch = Tch % och;
+            // LOOP(och)
+                for(int i = 0; i < 4; i++)
+                    for(int j = 0; j < 4; j++)
+                        devfin[(((((tbs*p+tp)*q+tq)*ch+tch)*och+toch)*4+i)*4+j] += devfin[(((((tbs*p+tp)*q+tq)*ch+(tch+s))*och+toch)*4+i)*4+j];
+        }
+        __syncthreads();
+    }
+
+    if(tch == 0) 
+    {
+
+            for(int i = 0; i < 4; i++)
+                for(int j = 0; j < 4; j++)
+                    devsum[((((tbs*och+toch)*p+tp)*q+tq)*4 + i)*4 + j] = devfin[(((((tbs*p+tp)*q+tq)*ch+0)*och+toch)*4+i)*4+j];
+    }
+     __syncthreads();
+  
+}
+
+__global__ void tile2(int bs, int p, int q, int ch, float *devin, float *devsum, float *devU, int h, int w, int och, float *devfin)
+{
+    int tbs, tp, tq, tch, tbsf, x;
+    tbsf = blockIdx.x;
+    tp = blockIdx.y;
+    tq = blockIdx.z;
+    x = threadIdx.x;
+    tbs = tbsf%bs;
+
+    int och_pb = MAX_THREAD/ch;
+    int tf = tbsf / bs;
+    int toch = x/ch + tf*(och_pb);
+    tch = x%ch; 
+
+    float V[4][4];
+    
+    // copy the tiles to thrtile
+    // int offset1 = (tbs*ch + tch)*h*w;
+    // for(int th = 2*tp, i = 0; i < 4; th++, i++)
+    //     for(int tw = 2*tq, j = 0; j < 4; tw++, j++)
+    //         thrtile[i][j] = devin[offset1 + th*w + tw];
+
+    int offset1 = (tbs*ch + tch)*h*w;
+    float av, bv, cv, dv, ev, fv, gv, hv, iv, jv, kv, lv, mv, nv, ov, pv;
+    int th = 2*tp, tw = 2*tq;
+    av = ACCESS(devin, offset1, th*w + tw++);
+    bv = ACCESS(devin, offset1, th*w + tw++);
+    cv = ACCESS(devin, offset1, th*w + tw++);
+    dv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    ev = ACCESS(devin, offset1, th*w + tw++);
+    fv = ACCESS(devin, offset1, th*w + tw++);
+    gv = ACCESS(devin, offset1, th*w + tw++);
+    hv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    iv = ACCESS(devin, offset1, th*w + tw++);
+    jv = ACCESS(devin, offset1, th*w + tw++);
+    kv = ACCESS(devin, offset1, th*w + tw++);
+    lv = ACCESS(devin, offset1, th*w + tw++);
+    th++; tw = 2*tq;
+    mv = ACCESS(devin, offset1, th*w + tw++);
+    nv = ACCESS(devin, offset1, th*w + tw++);
+    ov = ACCESS(devin, offset1, th*w + tw++);
+    pv = ACCESS(devin, offset1, th*w + tw++);
+    
+    //Calculation of V
+    int vx = 0, vy = 0;
+    ACCESS2D(V, vx, vy++) = +av-iv-cv+kv;
+    ACCESS2D(V, vx, vy++) = +bv-jv+cv-kv;
+    ACCESS2D(V, vx, vy++) = -bv+jv+cv-kv;
+    ACCESS2D(V, vx, vy++) = +bv-jv-dv+lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = +ev+iv-gv-kv;
+    ACCESS2D(V, vx, vy++) = +fv+jv+gv+kv;
+    ACCESS2D(V, vx, vy++) = -fv-jv+gv+kv;
+    ACCESS2D(V, vx, vy++) = +fv+jv-hv-lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = -ev+iv+gv-kv;
+    ACCESS2D(V, vx, vy++) = -fv+jv-gv+kv;
+    ACCESS2D(V, vx, vy++) = +fv-jv-gv+kv;
+    ACCESS2D(V, vx, vy++) = -fv+jv+hv-lv;
+    vx++; vy = 0;
+    ACCESS2D(V, vx, vy++) = +ev-mv-gv+ov;
+    ACCESS2D(V, vx, vy++) = +fv-nv+gv-ov;
+    ACCESS2D(V, vx, vy++) = -fv+nv+gv-ov;
+    ACCESS2D(V, vx, vy++) = +fv-nv-hv+pv;
+    
+    __syncthreads();
+
+    for(int i = 0; i <4; ++i)
+        for(int j = 0; j <4; ++j)
+            devfin[(((((tbs*p+tp)*q+tq)*ch+tch)*och+toch)*4+i)*4+j] = devU[((toch*ch+tch)*4+i)*4+j]*V[i][j]; 
+    
+    __syncthreads();
+
+    for(int s = 1; s < ch; s *= 2)
+    {
+        if(tch % (2*s) == 0 && tch+s < ch)
+        {
+            //toch = Tch % och;
+            // LOOP(och)
+                for(int i = 0; i < 4; i++)
+                    for(int j = 0; j < 4; j++)
+                        devfin[(((((tbs*p+tp)*q+tq)*ch+tch)*och+toch)*4+i)*4+j] += devfin[(((((tbs*p+tp)*q+tq)*ch+(tch+s))*och+toch)*4+i)*4+j];
+        }
+        __syncthreads();
+    }
+
+    if(tch == 0) 
+    {
+
+            for(int i = 0; i < 4; i++)
+                for(int j = 0; j < 4; j++)
+                    devsum[((((tbs*och+toch)*p+tp)*q+tq)*4 + i)*4 + j] = devfin[(((((tbs*p+tp)*q+tq)*ch+0)*och+toch)*4+i)*4+j];
+    }
+     __syncthreads();
+  
+}
+
+__global__ void lastcal(int och, int p, int q, int bs, float *devsum, float *devY)
+{
+    int tbs, tp, tq, toch;
+    tbs = blockIdx.x;
+    tp = blockIdx.y;
+    tq = blockIdx.z;
+    toch = threadIdx.x;
+
+    int offset = (((tbs*och+toch)*p+tp)*q+tq)*16;
+    float ay, by, cy, dy, ey, fy, gy, hy, iy, jy, ky, ly, my, ny, oy, py;
+    int ind = 0;
+    ay = ACCESS(devsum, offset, ind++);
+    by = ACCESS(devsum, offset, ind++);
+    cy = ACCESS(devsum, offset, ind++);
+    dy = ACCESS(devsum, offset, ind++);
+    ey = ACCESS(devsum, offset, ind++);
+    fy = ACCESS(devsum, offset, ind++);
+    gy = ACCESS(devsum, offset, ind++);
+    hy = ACCESS(devsum, offset, ind++);
+    iy = ACCESS(devsum, offset, ind++);
+    jy = ACCESS(devsum, offset, ind++);
+    ky = ACCESS(devsum, offset, ind++);
+    ly = ACCESS(devsum, offset, ind++);
+    my = ACCESS(devsum, offset, ind++);
+    ny = ACCESS(devsum, offset, ind++);
+    oy = ACCESS(devsum, offset, ind++);
+    py = ACCESS(devsum, offset, ind++);
+    
+    ind = 0;
+    offset = (((tbs*och+toch)*p+tp)*q+tq)*4;
+    
+    ACCESS(devY, offset, ind++) = ay+ey+iy+by+fy+jy+cy+gy+ky;
+    ACCESS(devY, offset, ind++) = by+fy+jy-cy-gy-ky-dy-hy-ly;
+    ACCESS(devY, offset, ind++) = ey-iy-my+fy-jy-ny+gy-ky-oy;
+    ACCESS(devY, offset, ind++) = fy-jy-ny-gy+ky+oy-hy+ly+py;
+}
+
+
+float * WING::forward(int och, int ch, int bs, int h, int w, int pad, float *in, int &oph, int &opw, float *kwt, float& conv_time, float& overhead_time)
+{
+    conv_time = 0;
+    overhead_time = 0;
+    float milliseconds = 0;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    float *devin, *devinnopad, *cutY, *devkwt, *devU;
+    size_t insize = bs * ch * h * w * sizeof(float);
+    int newh, neww;
+ 
+    gpu_error(cudaMalloc((void **) & devinnopad, insize));
+    gpu_error(cudaMemcpy(devinnopad, in, insize, cudaMemcpyHostToDevice));
+
+    newh = h + 2*pad;
+    neww = w + 2*pad;
+    oph = newh-2;
+    opw = neww-2;
+    if(newh%2)
+        newh++;
+    if(neww%2)
+        neww++;
+    if(newh < 4)
+        newh = 4;
+    if(neww < 4)
+        neww = 4;
+
+    insize = bs * ch * newh * neww * sizeof(float);
+    gpu_error(cudaMalloc((void **) & devin, insize));
+
+    // call padding
+    dim3 padgrid(bs, newh, neww);
+    dim3 padblock(ch, 1, 1);
+    
+    cudaEventRecord(start);
+    paddev<<<padgrid,padblock>>>(devin, devinnopad, h, w, pad);
+    cudaEventRecord(stop);
+
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    overhead_time += milliseconds;
+
+    gpu_error(cudaFree(devinnopad));
+    h = newh;
+    w = neww;
+
+    size_t kwtsize = och*ch*3*3*sizeof(float);    
+    size_t usize = och*ch*4*4*sizeof(float);
+    gpu_error(cudaMalloc((void **) & devkwt, kwtsize));
+    gpu_error(cudaMalloc((void **) & devU, usize));
+    gpu_error(cudaMemcpy(devkwt, kwt, kwtsize, cudaMemcpyHostToDevice));
+
+    cudaEventRecord(start);
+    precompute<<<ch, och>>>(och, ch, devkwt, devU);
+    cudaEventRecord(stop);
+
+    gpu_error(cudaFree(devkwt));
+
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    overhead_time += milliseconds;
+
+    size_t cutsize = bs*och*oph*opw*sizeof(float);
+    cutY = (float *)malloc(cutsize);
+
+    float *devsum, *devY, *devcutY;
+    float *devfin;
+    int p = max((h-2)/2, 0);
+    int q = max((w-2)/2, 0);
+
+    size_t finsize = MAX_B * p * q * ch * och * 4 * 4 * sizeof(float);
+    size_t sumsize = bs * och * p * q * 4 * 4 * sizeof(float);
+    size_t ysize = bs * och * p * q * 2 * 2 * sizeof(float);
+
+ 
+    gpu_error(cudaMalloc((void **) & devsum, sumsize));
+
+    gpu_error(cudaMalloc((void **) & devfin, finsize));
+
+    size_t binsize = ch * newh * neww ;
+    size_t dsumsize = och * p * q * 4 * 4 ;
+    int bsg = (bs+MAX_B-1)/MAX_B;
+    int prevb = 0;
+    LOOP(bsg)
+    {
+        int currb = MAX_B;
+        if(tbsg == bsg-1 && bs % MAX_B != 0)
+            currb = bs % MAX_B;
+        if(och*ch <= MAX_THREAD)
+        {
+            dim3 grid(currb, p, q); 
+            dim3 block(och*ch, 1, 1);
+            cudaEventRecord(start);
+            tile<<<grid, block>>>(currb, p, q, ch, devin + prevb*binsize, devsum + prevb*dsumsize, devU, h, w, och, devfin);
+            cudaEventRecord(stop);
+
+            cudaEventSynchronize(stop);
+            milliseconds = 0;
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            conv_time += milliseconds;
+
+        }
+        else
+        {
+            int f = (och*ch)/MAX_THREAD;
+            dim3 grid(currb*f, p, q); 
+            dim3 block(MAX_THREAD, 1, 1);
+            cudaEventRecord(start);
+            tile2<<<grid, block>>>(currb, p, q, ch, devin + prevb*binsize, devsum + prevb*dsumsize, devU, h, w, och, devfin);   
+            cudaEventRecord(stop);
+
+            cudaEventSynchronize(stop);
+            milliseconds = 0;
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            conv_time += milliseconds;
+
+        }
+        prevb  += currb;
+    }
+
+    gpu_error(cudaFree(devfin));
+    gpu_error(cudaFree(devin));    
+    gpu_error(cudaFree(devU));
+
+    dim3 grid2(bs, p, q);
+    dim3 block2(och, 1, 1);
+    gpu_error(cudaMalloc((void **) & devY, ysize));
+    cudaEventRecord(start);
+    lastcal<<<grid2,block2>>>(och, p, q, bs, devsum, devY);
+    cudaEventRecord(stop);
+
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    overhead_time += milliseconds;
+
+    gpu_error(cudaFree(devsum));
+
+    dim3 cutgrid(bs, p, q);
+    dim3 cutblock(och,1,1);
+    
+    
+    gpu_error(cudaMalloc((void **) & devcutY, cutsize));
+    cudaEventRecord(start);
+    cutpad<<<cutgrid, cutblock>>> (devY, devcutY, oph, opw);  
+    cudaEventRecord(stop);
+
+ 
+    gpu_error(cudaFree(devY));
+
+    cudaSafeCall(cudaMemcpy(cutY, devcutY, cutsize, cudaMemcpyDeviceToHost));
+    
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    overhead_time += milliseconds;
+
+    gpu_error(cudaFree(devcutY));
+
+    gpu_error(cudaEventDestroy(start));
+    gpu_error(cudaEventDestroy(stop));
+
+    return cutY;
+
 }
