@@ -25,8 +25,8 @@ __global__
 void direct_convolution(int input_channels, int input_height, int input_width, int out_channels, int kernel_height,int kernel_width, 
                         int padding, int stride, int H_out, int W_out, int W_grid, int tile_w, float* X, float* W_filter, float* Y) {
   int n , m , h0 , w0 , h_base, w_base, h , w;
-  int X_tile_width = (stride*tile_w) + kernal_width - stride;
-  int Y_tile_width = (stride*tile_w) + kernal_height - stride;
+  int X_tile_width = (stride*tile_w) + kernel_width - stride;
+  int Y_tile_width = (stride*tile_w) + kernel_height - stride;
 
   extern __shared__ float shmem[];
   float *X_shared = &shmem[0];
@@ -206,7 +206,7 @@ float* DirectShared::passforward(int out_channels, int input_channels, int kerne
 
   cudaEventRecord(start);
 
-  size_t shmem_size = sizeof(float) * (((stride*tile_width) + kernal_width - stride)*((stride*tile_height) + kernal_height - stride) + kernal_width*kernal_height);
+  size_t shmem_size = sizeof(float) * (((stride*tile_width) + kernel_width - stride)*((stride*tile_height) + kernel_height - stride) + kernel_width*kernel_height);
  
   /* calling the direct_convolution kernel */  
   direct_convolution<<< grid, block, shmem_size>>>(input_channels, input_height, input_width, out_channels, kernel_height, kernel_width, 
