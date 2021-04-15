@@ -21,12 +21,6 @@ nvidia-smi --query-gpu=memory.used --format=csv -lms 10 > memory_fft.txt &
 sleep 1
 pkill -9 nvidia-smi
 
-echo "Running for Winograd Convolution"
-nvidia-smi --query-gpu=memory.used --format=csv -lms 10 > memory_winograd.txt &
-./$BINARY "../../pretrained-models/vgg19.pb" "WINOGRAD" 1>/dev/null
-sleep 1
-pkill -9 nvidia-smi
-
 echo "Running for CUDNN Convolution"
 nvidia-smi --query-gpu=memory.used --format=csv -lms 10 > memory_cudnn.txt &
 ./$BINARY "../../pretrained-models/vgg19.pb" 1>/dev/null
