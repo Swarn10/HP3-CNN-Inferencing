@@ -21,7 +21,7 @@ sns.set(context = "poster", font_scale = 0.95, rc={"lines.linewidth": 1.5, 'line
 
 
 MEM_FILE = {}
-COLORS = ['deepskyblue','green','darkred','gold','violet']
+COLORS = ['deepskyblue','green','darkred']
 PLOT_DIR = "./Plots/"
 
 
@@ -77,18 +77,6 @@ if __name__ == "__main__":
         print ("FFT Convolution log not found..Skipping")
     else:
         MEM_FILE['FFT'] = "./memory_fft.txt"
-    
-    #Winograd Convolution File
-    if not os.path.exists("./memory_winograd.txt"):
-        print ("Winograd Convolution log not found..Skipping")
-    else:
-        MEM_FILE['WINOGRAD'] = "./memory_winograd.txt"
-    
-    #CUDNN Convolution File
-    if not os.path.exists("./memory_cudnn.txt"):
-        print ("CUDNN Convolution log not found..Skipping")
-    else:
-        MEM_FILE['CUDNN'] = "./memory_cudnn.txt"
         
     plotGPUData(MEM_FILE, COLORS, PLOT_DIR)
 
