@@ -9,8 +9,6 @@ OPERATIONS_LIBRARY = $(shell find $(PROJECT_DIR) -name operations.cc)
 DIRECT_CONV = $(shell find $(PROJECT_DIR) -name direct_conv.cu)
 FFT_FILE = fft_fast.cu
 FFT_KERNEL = $(shell find $(PROJECT_DIR) -name $(FFT_FILE))
-WINOGRAD_FILE = winograd_fast.cu
-WINOGRAD_KERNEL = $(shell find $(PROJECT_DIR) -name $(WINOGRAD_FILE))
 IM2COL_FILE = im2col.cu
 IM2COL_KERNEL = $(shell find $(PROJECT_DIR) -name $(IM2COL_FILE))
 
@@ -18,7 +16,7 @@ IM2COL_KERNEL = $(shell find $(PROJECT_DIR) -name $(IM2COL_FILE))
 
 all : test
 
-test: operations_test.cpp $(OPERATIONS_LIBRARY) $(FFT_KERNEL) $(DIRECT_CONV) $(WINOGRAD_KERNEL) $(IM2COL_KERNEL)
+test: operations_test.cpp $(OPERATIONS_LIBRARY) $(FFT_KERNEL) $(DIRECT_CONV) $(IM2COL_KERNEL)
 	$(NVCC) -I $(PROJECT_DIR) -L $(CUBLAS) $(CXXFLAGS) $? $(OPENCV_LIB_FLAGS) $(CUDA_LIB_FLAGS) -o $@
 
 clean:
@@ -36,10 +34,6 @@ run_direct:
 
 run_fft:
 	./test "FFT"
-	python operations_test.py
-
-run_winograd:
-	./test "WINOGRAD"
 	python operations_test.py
 
 run_im2col:
