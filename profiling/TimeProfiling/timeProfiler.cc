@@ -22,8 +22,6 @@ std::string convertAlgoTypeToString(customAlgorithmType t) {
       return "DIRECT";
     case t_CUSTOM_FFT:
       return "FFT";
-    case t_CUSTOM_WINOGRAD:
-      return "WINOGRAD";
     case t_CUSTOM_IM2COL:
       return "IM2COL";
   }
@@ -112,9 +110,6 @@ int main(int argc, char **argv) {
     }
     else if(algo == "FFT") {
       t = t_CUSTOM_FFT;
-    }
-    else if(algo == "WINOGRAD") {
-      t = t_CUSTOM_WINOGRAD;
     }
     else if(algo == "IM2COL") {
       t = t_CUSTOM_IM2COL;
