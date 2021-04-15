@@ -49,10 +49,6 @@ run_fft:
 	@echo ""
 	./test "$(PROJECT_DIR)/pretrained-models/alexnet.pb" "FFT" 1>/dev/null
 	python batch_test.py alex
-	
-run_winograd:
-	./test "$(PROJECT_DIR)/pretrained-models/vgg19.pb" "WINOGRAD" 1>/dev/null
-	python batch_test.py vgg
 
 run_im2col:
 	./test "$(PROJECT_DIR)/pretrained-models/vgg19.pb" "IM2COL" 1>/dev/null
