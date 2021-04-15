@@ -96,9 +96,6 @@ float* Conv2D::ConvForward(float* input, profilingElapsedTime &time_elapsed) {
     case t_CUSTOM_DIRECT:
       output = this->Conv_Direct(input, time_elapsed);
       break;
-    case t_CUSTOM_WINOGRAD:
-      output = this->Conv_Winograd(input, time_elapsed);
-      break;
     case t_CUSTOM_FFT:
       output = this->Conv_FFT(input, time_elapsed);
       break;
