@@ -20,7 +20,6 @@
 
 #include "kernels/Direct/direct_conv.h"
 #include "kernels/FFT/fftheader.h"
-#include "kernels/winograd/wingheader.h"
 #include "kernels/im2col/im2col.hpp"
 
 /* Macro to check CUDNN error and print the error message */
@@ -55,8 +54,7 @@ typedef enum{
   t_CUDNN = 0,
   t_CUSTOM_DIRECT,
   t_CUSTOM_FFT,
-  t_CUSTOM_IM2COL,
-  t_CUSTOM_WINOGRAD
+  t_CUSTOM_IM2COL
 } customAlgorithmType; 
 
 /* Class for Convolution Operation :
@@ -148,8 +146,7 @@ class Conv2D {
   /* Forward Pass Operation using FFT Kernel */
   float* Conv_FFT(float* input, profilingElapsedTime &time_elapsed);
 
-  /* Forward Pass Operation using WInograd Kernel */
-  float* Conv_Winograd(float* input, profilingElapsedTime &time_elapsed);
+  
 
   /* Forward Pass Operation using Im2Col Kernel */
   float* Conv_Im2Col(float* input, profilingElapsedTime &time_elapsed);
