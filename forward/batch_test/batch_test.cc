@@ -24,9 +24,6 @@ int main(int argc, char **argv) {
     else if(algo == "FFT") {
       t = t_CUSTOM_FFT;
     }
-    else if(algo == "WINOGRAD") {
-      t = t_CUSTOM_WINOGRAD;
-    }
     else if(algo == "IM2COL") {
       t = t_CUSTOM_IM2COL;
     }
